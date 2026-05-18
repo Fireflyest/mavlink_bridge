@@ -45,7 +45,7 @@ int main(int argc, char *argv[]) {
     case 2: // 详细
         log.heartbeat = true;
         log.raw_bytes = true;
-        log.stats_interval = 5;
+        log.stats_interval = 10;
         break;
     default: // 正常 (1)
         break;

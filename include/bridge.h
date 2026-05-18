@@ -6,6 +6,9 @@
 #include <mavsdk/mavsdk.h>
 #include <mavsdk/plugins/action/action.h>
 #include <mavsdk/plugins/telemetry/telemetry.h>
+#include <mavsdk/plugins/action/action.h>
+#include <mavsdk/plugins/offboard/offboard.h>
+#include <mavsdk/plugins/telemetry/telemetry.h>
 #include <string>
 #include <memory>
 #include <atomic>
@@ -52,7 +55,9 @@ public:
 
     // VLA 命令处理
     void handle_vla_cmd(const char *cmd, char *resp, int resp_size);
-
+    void exec_cmd(const char *cmd_name, float *args, int argc,
+                        char *resp, int resp_size);
+    void build_status_response(char *resp, int resp_size);
 private:
     int parse_serial_url(const std::string &url, std::string &device, int &baudrate);
     int open_serial(const char *device, int baudrate);
@@ -84,6 +89,7 @@ private:
     std::unique_ptr<mavsdk::Mavsdk> m_mavsdk;
     std::shared_ptr<mavsdk::System> m_sys;
     std::unique_ptr<mavsdk::Action> m_action;
+    std::unique_ptr<mavsdk::Offboard> m_offboard;
     std::unique_ptr<mavsdk::Telemetry> m_telemetry;
 
     // 统计
@@ -92,4 +98,11 @@ private:
     int m_sdk_rx = 0;
     time_t m_last_stats = 0;
     time_t m_last_pos_log = 0;
+
+    float m_last_alt = -999;
+    float m_last_lat = -999;
+    float m_last_lon = -999;
+    bool m_last_armed = false;
+    mavsdk::Telemetry::FlightMode m_last_flight_mode =
+        mavsdk::Telemetry::FlightMode::Unknown;
 };

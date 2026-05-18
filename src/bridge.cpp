@@ -61,23 +61,35 @@ static uint32_t extract_msgid(const uint8_t *buf, int len) {
 void Bridge::setup_logging(const LogConfig &log) {
     m_telemetry->subscribe_position([this](mavsdk::Telemetry::Position pos) {
         if (!m_log.position) return;
-        time_t now = time(NULL);
-        if (now - m_last_pos_log < 2) return;
-        m_last_pos_log = now;
+        /* 变化检测：高度变化 <0.3m 且位置变化 <0.000001° 时跳过 */
+        float alt_diff = std::abs(pos.relative_altitude_m - m_last_alt);
+        float lat_diff = std::abs(pos.latitude_deg - m_last_lat);
+        float lon_diff = std::abs(pos.longitude_deg - m_last_lon);
+        if (alt_diff < 0.3f && lat_diff < 0.000001f && lon_diff < 0.000001f)
+            return;
+        m_last_alt = pos.relative_altitude_m;
+        m_last_lat = pos.latitude_deg;
+        m_last_lon = pos.longitude_deg;
         printf("[遥测] 高度=%.1fm 位置=(%.7f, %.7f)\n",
                pos.relative_altitude_m, pos.latitude_deg, pos.longitude_deg);
     });
 
     m_telemetry->subscribe_armed([this](bool armed) {
         if (!m_log.armed) return;
+        /* 只在状态变化时输出 */
+        if (armed == m_last_armed) return;
+        m_last_armed = armed;
         printf("[遥测] %s\n", armed ? "已解锁" : "已锁定");
     });
 
     m_telemetry->subscribe_flight_mode([this](mavsdk::Telemetry::FlightMode mode) {
         if (!m_log.heartbeat) return;
+        if (mode == m_last_flight_mode) return;
+        m_last_flight_mode = mode;
         printf("[心跳] 飞行模式: %d\n", (int)mode);
     });
 }
+
 
 bool Bridge::init(const BridgeConfig &cfg, const LogConfig &log) {
     m_log = log;
@@ -182,6 +194,7 @@ bool Bridge::init(const BridgeConfig &cfg, const LogConfig &log) {
 
     /* 6. 插件 + 日志 */
     m_action = std::make_unique<mavsdk::Action>(m_sys);
+    m_offboard = std::make_unique<mavsdk::Offboard>(m_sys);
     m_telemetry = std::make_unique<mavsdk::Telemetry>(m_sys);
     setup_logging(log);
 
@@ -193,6 +206,7 @@ bool Bridge::init(const BridgeConfig &cfg, const LogConfig &log) {
 void Bridge::shutdown() {
     m_running = false;
     m_telemetry.reset();
+    m_offboard.reset();
     m_action.reset();
     m_sys.reset();
     m_mavsdk.reset();
@@ -343,96 +357,263 @@ void Bridge::print_status() {
 }
 
 void Bridge::handle_vla_cmd(const char *cmd, char *resp, int resp_size) {
-    Mode mode = m_mode;
+    // 解析命令名和参数
+    char cmd_name[64];
+    float args[8];
+    int argc = 0;
 
-    if (strcmp(cmd, "HEARTBEAT") == 0 || strcmp(cmd, "STATUS") == 0) {
-        auto pos = m_telemetry->position();
-        auto armed = m_telemetry->armed();
-        auto flight_mode = m_telemetry->flight_mode();
-        const char* mode_str = "UNKNOWN";
-        switch (flight_mode) {
-            case mavsdk::Telemetry::FlightMode::Ready:       mode_str = "READY"; break;
-            case mavsdk::Telemetry::FlightMode::Takeoff:     mode_str = "TAKEOFF"; break;
-            case mavsdk::Telemetry::FlightMode::Hold:        mode_str = "HOLD"; break;
-            case mavsdk::Telemetry::FlightMode::Mission:     mode_str = "AUTO"; break;
-            case mavsdk::Telemetry::FlightMode::ReturnToLaunch: mode_str = "RTL"; break;
-            case mavsdk::Telemetry::FlightMode::Land:        mode_str = "LAND"; break;
-            case mavsdk::Telemetry::FlightMode::Offboard:    mode_str = "OFFBOARD"; break;
-            case mavsdk::Telemetry::FlightMode::Manual:      mode_str = "MANUAL"; break;
-            case mavsdk::Telemetry::FlightMode::Altctl:      mode_str = "ALTCTL"; break;
-            case mavsdk::Telemetry::FlightMode::Posctl:      mode_str = "POSCTL"; break;
-            case mavsdk::Telemetry::FlightMode::Acro:        mode_str = "ACRO"; break;
-            case mavsdk::Telemetry::FlightMode::Stabilized:  mode_str = "STABILIZE"; break;
-            case mavsdk::Telemetry::FlightMode::Rattitude:   mode_str = "RATTITUDE"; break;
-            default:                                          mode_str = "OTHER"; break;
-        }
-        snprintf(resp, resp_size, "TELEMETRY %.1f %.7f %.7f %d %s",
-                 pos.relative_altitude_m, pos.latitude_deg, pos.longitude_deg,
-                 armed ? 1 : 0, mode_str);
+    // "VELOCITY 1.0 0.0 0.0" → cmd_name="VELOCITY", args=[1.0, 0.0, 0.0]
+    if (sscanf(cmd, "%63s", cmd_name) != 1) {
+        snprintf(resp, resp_size, "ERR parse");
+        return;
+    }
 
-    } else if (strcmp(cmd, "ARM") == 0) {
-        if (mode == Mode::Auto) {
-            auto result = m_action->arm();
-            if (result == mavsdk::Action::Result::Success) {
-                snprintf(resp, resp_size, "OK ARM");
-            } else {
-                snprintf(resp, resp_size, "ERR ARM (%d)", (int)result);
+    // 提取参数
+    const char *p = cmd + strlen(cmd_name);
+    while (*p && argc < 8) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        args[argc++] = strtof(p, (char**)&p);
+    }
+
+    // 分发执行
+    exec_cmd(cmd_name, args, argc, resp, resp_size);
+}
+
+void Bridge::exec_cmd(const char *cmd_name, float *args, int argc,
+                       char *resp, int resp_size) {
+    auto ok = [&](const char *msg) { snprintf(resp, resp_size, "OK %s", msg); };
+    auto err = [&](const char *msg, int code) { snprintf(resp, resp_size, "ERR %s (%d)", msg, code); };
+
+    mavsdk::Action::Result r;
+
+    // === 飞行控制 ===
+    if (strcmp(cmd_name, "ARM") == 0) {
+        r = m_action->arm();
+        r == mavsdk::Action::Result::Success ? ok("ARM") : err("ARM", (int)r);
+    }
+    else if (strcmp(cmd_name, "DISARM") == 0) {
+        r = m_action->disarm();
+        r == mavsdk::Action::Result::Success ? ok("DISARM") : err("DISARM", (int)r);
+    }
+    else if (strcmp(cmd_name, "TAKEOFF") == 0) {
+        float alt = argc > 0 ? args[0] : 10.f;
+        m_action->set_takeoff_altitude(alt);
+        r = m_action->takeoff();
+        r == mavsdk::Action::Result::Success
+            ? ok(("TAKEOFF " + std::to_string((int)alt)).c_str())
+            : err("TAKEOFF", (int)r);
+    }
+    else if (strcmp(cmd_name, "LAND") == 0) {
+        r = m_action->land();
+        r == mavsdk::Action::Result::Success ? ok("LAND") : err("LAND", (int)r);
+    }
+    else if (strcmp(cmd_name, "RTL") == 0) {
+        r = m_action->return_to_launch();
+        r == mavsdk::Action::Result::Success ? ok("RTL") : err("RTL", (int)r);
+    }
+    else if (strcmp(cmd_name, "HOLD") == 0 || strcmp(cmd_name, "LOITER") == 0) {
+        r = m_action->hold();
+        r == mavsdk::Action::Result::Success ? ok("HOLD") : err("HOLD", (int)r);
+    }
+    else if (strcmp(cmd_name, "VELOCITY") == 0) {
+        float vx = argc > 0 ? args[0] : 0;
+        float vy = argc > 1 ? args[1] : 0;
+        float vz = argc > 2 ? args[2] : 0;
+        float duration = argc > 3 ? args[3] : 0;  // 0=不自动停止
+
+        /* 安全限制 */
+        const float MAX_VEL = 3.0f;
+        const float MAX_VZ = 2.0f;
+        const float MAX_DUR = 30.0f;
+        vx = std::max(-MAX_VEL, std::min(MAX_VEL, vx));
+        vy = std::max(-MAX_VEL, std::min(MAX_VEL, vy));
+        vz = std::max(-MAX_VZ, std::min(MAX_VZ, vz));
+        if (duration > 0) duration = std::min(duration, MAX_DUR);
+
+        /* 启动 Offboard */
+        if (m_offboard->is_active() != true) {
+            m_offboard->set_velocity_ned({0, 0, 0, 0});
+            if (m_offboard->start() != mavsdk::Offboard::Result::Success) {
+                err("VELOCITY start offboard", 0);
+                return;
             }
-        } else {
-            snprintf(resp, resp_size, "ERR mode=%s", mode_to_str(mode));
         }
 
-    } else if (strncmp(cmd, "TAKEOFF", 7) == 0) {
-        if (mode == Mode::Auto) {
-            float alt = 10.0f;
-            if (cmd[7] == ' ') alt = atof(cmd + 8);
-            m_action->set_takeoff_altitude(alt);
-            auto result = m_action->takeoff();
-            if (result == mavsdk::Action::Result::Success) {
-                snprintf(resp, resp_size, "OK TAKEOFF %.1f", alt);
-            } else {
-                snprintf(resp, resp_size, "ERR TAKEOFF (%d)", (int)result);
-            }
+        m_offboard->set_velocity_ned({vx, vy, vz, 0});
+
+        if (m_log.commands)
+            printf("[CMD] VELOCITY %.2f %.2f %.2f dur=%.1fs\n",
+                   vx, vy, vz, duration);
+
+        /* 如果指定了持续时间，等待后自动停止 */
+        if (duration > 0) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds((int)(duration * 1000)));
+
+            /* 停止，悬停 */
+            m_offboard->set_velocity_ned({0, 0, 0, 0});
+            m_offboard->stop();
+            m_action->hold();
+
+            if (m_log.commands)
+                printf("[CMD] VELOCITY %.1fs 已停止，悬停\n", duration);
+
+            snprintf(resp, resp_size, "OK VELOCITY %.2f %.2f %.2f %.1f",
+                     vx, vy, vz, duration);
         } else {
-            snprintf(resp, resp_size, "ERR mode=%s", mode_to_str(mode));
+            snprintf(resp, resp_size, "OK VELOCITY %.2f %.2f %.2f",
+                     vx, vy, vz);
         }
-    } else if (strcmp(cmd, "LAND") == 0) {
-        if (mode == Mode::Auto) {
-            auto result = m_action->return_to_launch();
-            if (result == mavsdk::Action::Result::Success) {
-                snprintf(resp, resp_size, "OK RTL");
-            } else {
-                snprintf(resp, resp_size, "ERR RTL (%d)", (int)result);
+    }
+    else if (strcmp(cmd_name, "STOP_OFFBOARD") == 0) {
+        /* 停止 Offboard 模式 */
+        if (m_offboard->is_active()) {
+            m_offboard->stop();
+        }
+        /* 切回悬停 */
+        m_action->hold();
+        ok("STOP_OFFBOARD");
+    }
+    else if (strcmp(cmd_name, "YAW") == 0) {
+        float target_delta = argc > 0 ? args[0] : 0;
+
+        /* 安全限制 */
+        const float MAX_YAW = 360.0f;
+        target_delta = std::max(-MAX_YAW, std::min(MAX_YAW, target_delta));
+
+        /* 获取当前偏航角 */
+        auto euler = m_telemetry->attitude_euler();
+        float start_yaw = euler.yaw_deg;  // [-180, 180]
+        float target_yaw = start_yaw + target_delta;
+
+        /* 归一化到 [-180, 180] */
+        while (target_yaw > 180.f)  target_yaw -= 360.f;
+        while (target_yaw < -180.f) target_yaw += 360.f;
+
+        printf("[YAW] 当前=%.1f° 目标=%.1f° (delta=%.1f°)\n",
+               start_yaw, target_yaw, target_delta);
+
+        /* 启动 Offboard */
+        if (m_offboard->is_active() != true) {
+            m_offboard->set_velocity_ned({0, 0, 0, 0});
+            if (m_offboard->start() != mavsdk::Offboard::Result::Success) {
+                err("YAW start offboard", 0);
+                return;
             }
-        } else {
-            snprintf(resp, resp_size, "ERR mode=%s", mode_to_str(mode));
         }
 
-    } else if (strcmp(cmd, "RTL") == 0) {
-        if (mode == Mode::Auto) {
-            auto result = m_action->return_to_launch();
-            if (result == mavsdk::Action::Result::Success) {
-                snprintf(resp, resp_size, "OK RTL");
-            } else {
-                snprintf(resp, resp_size, "ERR RTL (%d)", (int)result);
+        /* 开始旋转 */
+        float yaw_rate = 30.0f;
+        if (target_delta < 0) yaw_rate = -30.0f;
+        m_offboard->set_velocity_ned({0, 0, 0, yaw_rate});
+
+        /* 闭环等待：实时检查偏航角 */
+        const float angle_tolerance = 5.0f;   // 5° 容差
+        const int timeout_ms = (int)(std::abs(target_delta) / 30.f * 1000.f) + 5000;
+        auto start_time = std::chrono::steady_clock::now();
+
+        bool reached = false;
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            auto now = std::chrono::steady_clock::now();
+            int elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now - start_time).count();
+            if (elapsed_ms > timeout_ms) {
+                printf("[YAW] 超时 (%dms)\n", elapsed_ms);
+                break;
             }
-        } else {
-            snprintf(resp, resp_size, "ERR mode=%s", mode_to_str(mode));
+
+            euler = m_telemetry->attitude_euler();
+            float current_yaw = euler.yaw_deg;
+
+            /* 计算剩余角度（处理环绕） */
+            float remaining = target_yaw - current_yaw;
+            if (remaining > 180.f)  remaining -= 360.f;
+            if (remaining < -180.f) remaining += 360.f;
+
+            if (std::abs(remaining) <= angle_tolerance) {
+                printf("[YAW] 到达目标 %.1f° (实际 %.1f°, 剩余 %.1f°)\n",
+                       target_yaw, current_yaw, remaining);
+                reached = true;
+                break;
+            }
+
+            /* 超调检测：如果已经开始反向走，说明过了 */
+            if ((target_delta > 0 && remaining < -angle_tolerance) ||
+                (target_delta < 0 && remaining > angle_tolerance)) {
+                printf("[YAW] 超调检测：实际 %.1f°, 剩余 %.1f°\n",
+                       current_yaw, remaining);
+                reached = true;
+                break;
+            }
+
+            if (m_log.commands && elapsed_ms % 1000 < 100) {
+                printf("[YAW] 旋转中... %.1f° → %.1f° (剩余 %.1f°)\n",
+                       current_yaw, target_yaw, remaining);
+            }
         }
 
-    } else if (strcmp(cmd, "LOITER") == 0) {
-        if (mode == Mode::Auto) {
-            auto result = m_action->hold();
-            if (result == mavsdk::Action::Result::Success) {
-                snprintf(resp, resp_size, "OK LOITER");
-            } else {
-                snprintf(resp, resp_size, "ERR LOITER (%d)", (int)result);
-            }
-        } else {
-            snprintf(resp, resp_size, "ERR mode=%s", mode_to_str(mode));
-        }
+        /* 停止旋转，悬停 */
+        m_offboard->set_velocity_ned({0, 0, 0, 0});
+        m_offboard->stop();
+        m_action->hold();
 
-    } else {
-        snprintf(resp, resp_size, "ERR unknown: %s", cmd);
+        if (reached) {
+            snprintf(resp, resp_size, "OK YAW %.1f", target_delta);
+        } else {
+            snprintf(resp, resp_size, "ERR YAW timeout");
+        }
+    }
+    else if (strcmp(cmd_name, "WAIT") == 0) {
+        /* WAIT 不做任何事，只返回 OK，客户端负责等待 */
+        int sec = argc > 0 ? (int)args[0] : 1;
+        if (m_log.commands)
+            printf("[CMD] WAIT %ds\n", sec);
+        snprintf(resp, resp_size, "OK WAIT %d", sec);
+    }
+
+
+    // === 状态查询 ===
+    else if (strcmp(cmd_name, "HEARTBEAT") == 0 || strcmp(cmd_name, "STATUS") == 0) {
+        build_status_response(resp, resp_size);
+    }
+    else if (strcmp(cmd_name, "GET_STATUS") == 0) {
+        build_status_response(resp, resp_size);
+    }
+
+    // === 未知命令 ===
+    else {
+        snprintf(resp, resp_size, "ERR unknown: %s", cmd_name);
     }
 }
+
+
+void Bridge::build_status_response(char *resp, int resp_size) {
+    auto pos = m_telemetry->position();
+    auto armed = m_telemetry->armed();
+    auto flight_mode = m_telemetry->flight_mode();
+
+    const char* mode_str = "UNKNOWN";
+    switch (flight_mode) {
+        case mavsdk::Telemetry::FlightMode::Ready:          mode_str = "READY"; break;
+        case mavsdk::Telemetry::FlightMode::Takeoff:        mode_str = "TAKEOFF"; break;
+        case mavsdk::Telemetry::FlightMode::Hold:           mode_str = "HOLD"; break;
+        case mavsdk::Telemetry::FlightMode::Mission:        mode_str = "AUTO"; break;
+        case mavsdk::Telemetry::FlightMode::ReturnToLaunch: mode_str = "RTL"; break;
+        case mavsdk::Telemetry::FlightMode::Land:           mode_str = "LAND"; break;
+        case mavsdk::Telemetry::FlightMode::Offboard:       mode_str = "OFFBOARD"; break;
+        case mavsdk::Telemetry::FlightMode::Manual:         mode_str = "MANUAL"; break;
+        case mavsdk::Telemetry::FlightMode::Altctl:         mode_str = "ALTCTL"; break;
+        case mavsdk::Telemetry::FlightMode::Posctl:         mode_str = "POSCTL"; break;
+        case mavsdk::Telemetry::FlightMode::Acro:           mode_str = "ACRO"; break;
+        case mavsdk::Telemetry::FlightMode::Stabilized:     mode_str = "STABILIZE"; break;
+        default:                                             mode_str = "OTHER"; break;
+    }
+
+    snprintf(resp, resp_size, "TELEMETRY %.1f %.7f %.7f %d %s",
+             pos.relative_altitude_m, pos.latitude_deg, pos.longitude_deg,
+             armed ? 1 : 0, mode_str);
+}
+
