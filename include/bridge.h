@@ -49,8 +49,12 @@ public:
     void cmd_land();
     void cmd_rtl();
     void cmd_loiter();
+    bool cmd_goto(double latitude_deg, double longitude_deg, float absolute_altitude_m, float yaw_deg);
+    bool cmd_set_mark(double latitude_deg, double longitude_deg, float absolute_altitude_m);
     void set_mode(Mode mode);
     Mode get_mode() const { return m_mode; }
+    bool has_mark_point() const { return m_mark_valid; }
+    bool get_mark_point(double &latitude_deg, double &longitude_deg, float &absolute_altitude_m) const;
     void print_status();
 
     // VLA 命令处理
@@ -105,4 +109,9 @@ private:
     bool m_last_armed = false;
     mavsdk::Telemetry::FlightMode m_last_flight_mode =
         mavsdk::Telemetry::FlightMode::Unknown;
+
+    bool m_mark_valid = false;
+    double m_mark_latitude_deg = 0.0;
+    double m_mark_longitude_deg = 0.0;
+    float m_mark_absolute_altitude_m = 0.0f;
 };

@@ -11,9 +11,27 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 
 const char* mode_to_str(Mode m) {
     return m == Mode::Auto ? "AUTO" : "MANUAL";
+}
+
+static const char* yesno(bool value) {
+    return value ? "1" : "0";
+}
+
+static const char* gps_fix_to_str(mavsdk::Telemetry::FixType fix_type) {
+    switch (fix_type) {
+        case mavsdk::Telemetry::FixType::NoGps:    return "NoGps";
+        case mavsdk::Telemetry::FixType::NoFix:    return "NoFix";
+        case mavsdk::Telemetry::FixType::Fix2D:    return "2D";
+        case mavsdk::Telemetry::FixType::Fix3D:    return "3D";
+        case mavsdk::Telemetry::FixType::FixDgps:  return "DGPS";
+        case mavsdk::Telemetry::FixType::RtkFloat: return "RTKFloat";
+        case mavsdk::Telemetry::FixType::RtkFixed: return "RTKFixed";
+        default:                                   return "Unknown";
+    }
 }
 
 Bridge::Bridge() = default;
@@ -33,22 +51,64 @@ int Bridge::parse_serial_url(const std::string &url, std::string &device, int &b
     return 0;
 }
 
+static bool baudrate_to_speed(int baudrate, speed_t &speed) {
+    switch (baudrate) {
+        case 9600:    speed = B9600; break;
+        case 19200:   speed = B19200; break;
+        case 38400:   speed = B38400; break;
+        case 57600:   speed = B57600; break;
+        case 115200:  speed = B115200; break;
+        case 230400:  speed = B230400; break;
+        case 460800:  speed = B460800; break;
+        case 921600:  speed = B921600; break;
+        default:      return false;
+    }
+    return true;
+}
+
 int Bridge::open_serial(const char *device, int baudrate) {
-    int fd = open(device, O_RDWR | O_NOCTTY);
+    int fd = open(device, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) { perror("open serial"); return -1; }
 
     struct termios tio{};
-    tcgetattr(fd, &tio);
+    if (tcgetattr(fd, &tio) != 0) {
+        perror("tcgetattr");
+        close(fd);
+        return -1;
+    }
     cfmakeraw(&tio);
-    cfsetispeed(&tio, baudrate);
-    cfsetospeed(&tio, baudrate);
+    speed_t speed = B115200;
+    if (!baudrate_to_speed(baudrate, speed)) {
+        fprintf(stderr, "unsupported serial baudrate: %d\n", baudrate);
+        close(fd);
+        return -1;
+    }
+    if (cfsetispeed(&tio, speed) != 0 || cfsetospeed(&tio, speed) != 0) {
+        perror("cfset*speed");
+        close(fd);
+        return -1;
+    }
     tio.c_cflag |= CLOCAL | CREAD;
     tio.c_cc[VMIN] = 0;
     tio.c_cc[VTIME] = 0;
-    tcsetattr(fd, TCSANOW, &tio);
-    tcflush(fd, TCIOFLUSH);
+    if (tcsetattr(fd, TCSANOW, &tio) != 0) {
+        perror("tcsetattr");
+        close(fd);
+        return -1;
+    }
+    if (tcflush(fd, TCIOFLUSH) != 0) {
+        perror("tcflush");
+        close(fd);
+        return -1;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    }
     return fd;
 }
+
 
 /* 从原始字节中提取消息 ID（支持 v1/v2） */
 static uint32_t extract_msgid(const uint8_t *buf, int len) {
@@ -342,6 +402,46 @@ void Bridge::cmd_loiter() {
     if (m_log.commands) printf("[CMD] LOITER: %d\n", (int)r);
 }
 
+bool Bridge::cmd_goto(double latitude_deg, double longitude_deg, float absolute_altitude_m, float yaw_deg) {
+    if (!m_telemetry) {
+        printf("[CMD] GOTO 失败: 遥测未就绪\n");
+        return false;
+    }
+
+    auto health = m_telemetry->health();
+    if (!health.is_global_position_ok) {
+        printf("[CMD] GOTO 失败: 全局定位不可用\n");
+        return false;
+    }
+
+    auto r = m_action->goto_location(latitude_deg, longitude_deg, absolute_altitude_m, yaw_deg);
+    if (m_log.commands) {
+        printf("[CMD] GOTO lat=%.7f lon=%.7f alt=%.1fm yaw=%.1f: %d\n",
+               latitude_deg, longitude_deg, absolute_altitude_m, yaw_deg, (int)r);
+    }
+    return r == mavsdk::Action::Result::Success;
+}
+
+bool Bridge::cmd_set_mark(double latitude_deg, double longitude_deg, float absolute_altitude_m) {
+    m_mark_valid = true;
+    m_mark_latitude_deg = latitude_deg;
+    m_mark_longitude_deg = longitude_deg;
+    m_mark_absolute_altitude_m = absolute_altitude_m;
+    if (m_log.commands) {
+        printf("[CMD] SET_HOME(mark) lat=%.7f lon=%.7f alt=%.1fm\n",
+               latitude_deg, longitude_deg, absolute_altitude_m);
+    }
+    return true;
+}
+
+bool Bridge::get_mark_point(double &latitude_deg, double &longitude_deg, float &absolute_altitude_m) const {
+    if (!m_mark_valid) return false;
+    latitude_deg = m_mark_latitude_deg;
+    longitude_deg = m_mark_longitude_deg;
+    absolute_altitude_m = m_mark_absolute_altitude_m;
+    return true;
+}
+
 void Bridge::set_mode(Mode mode) {
     m_mode = mode;
     printf("[MODE] %s\n", mode_to_str(mode));
@@ -350,10 +450,45 @@ void Bridge::set_mode(Mode mode) {
 void Bridge::print_status() {
     auto pos = m_telemetry->position();
     auto armed = m_telemetry->armed();
-    printf("[状态] 模式=%s 高度=%.1fm 位置=(%.7f, %.7f) %s\n",
-           mode_to_str(m_mode), pos.relative_altitude_m,
-           pos.latitude_deg, pos.longitude_deg,
-           armed ? "ARMED" : "DISARMED");
+    auto in_air = m_telemetry->in_air();
+    auto gps = m_telemetry->gps_info();
+    auto attitude = m_telemetry->attitude_euler();
+    auto velocity = m_telemetry->velocity_ned();
+    auto heading = m_telemetry->heading();
+    auto battery = m_telemetry->battery();
+    auto health = m_telemetry->health();
+    auto health_all_ok = m_telemetry->health_all_ok();
+    auto home = m_telemetry->home();
+
+    printf("[状态] 模式=%s 电机解锁=%s 已起飞=%s 健康=%s GPS=%s(%d星) 位置=(%.7f, %.7f, 绝对高=%.1fm, 相对高=%.1fm) 姿态=(roll=%.1f, pitch=%.1f, yaw=%.1f) 航向=%.1f 速度=(N=%.1f, E=%.1f, D=%.1f) 电量=%.1f%% 电压=%.1fV 电流=%.1fA Home=(%.7f, %.7f, %.1fm) Mark=%s",
+        mode_to_str(m_mode),
+        yesno(armed),
+        yesno(in_air),
+        yesno(health_all_ok),
+        gps_fix_to_str(gps.fix_type), gps.num_satellites,
+        pos.latitude_deg, pos.longitude_deg,
+        pos.absolute_altitude_m, pos.relative_altitude_m,
+        attitude.roll_deg, attitude.pitch_deg, attitude.yaw_deg,
+        heading.heading_deg,
+        velocity.north_m_s, velocity.east_m_s, velocity.down_m_s,
+        battery.remaining_percent, battery.voltage_v, battery.current_battery_a,
+        home.latitude_deg, home.longitude_deg, home.absolute_altitude_m,
+        m_mark_valid ? "set" : "unset");
+
+    if (m_mark_valid) {
+        printf(" (%.7f, %.7f, %.1fm)\n", m_mark_latitude_deg, m_mark_longitude_deg, m_mark_absolute_altitude_m);
+    } else {
+        printf("\n");
+    }
+
+    printf("         健康项: gyro=%s accel=%s mag=%s local_pos=%s global_pos=%s home=%s armable=%s\n",
+        yesno(health.is_gyrometer_calibration_ok),
+        yesno(health.is_accelerometer_calibration_ok),
+        yesno(health.is_magnetometer_calibration_ok),
+        yesno(health.is_local_position_ok),
+        yesno(health.is_global_position_ok),
+        yesno(health.is_home_position_ok),
+        yesno(health.is_armable));
 }
 
 void Bridge::handle_vla_cmd(const char *cmd, char *resp, int resp_size) {
@@ -415,6 +550,60 @@ void Bridge::exec_cmd(const char *cmd_name, float *args, int argc,
     else if (strcmp(cmd_name, "HOLD") == 0 || strcmp(cmd_name, "LOITER") == 0) {
         r = m_action->hold();
         r == mavsdk::Action::Result::Success ? ok("HOLD") : err("HOLD", (int)r);
+    }
+    else if (strcmp(cmd_name, "GOTO") == 0 || strcmp(cmd_name, "POSITION") == 0) {
+        double latitude_deg;
+        double longitude_deg;
+        float absolute_altitude_m;
+        float yaw_deg;
+
+        if (argc >= 3) {
+            latitude_deg = args[0];
+            longitude_deg = args[1];
+            absolute_altitude_m = args[2];
+            if (argc >= 4) {
+                yaw_deg = args[3];
+            } else {
+                yaw_deg = m_telemetry->heading().heading_deg;
+            }
+        } else if (m_mark_valid) {
+            latitude_deg = m_mark_latitude_deg;
+            longitude_deg = m_mark_longitude_deg;
+            absolute_altitude_m = m_mark_absolute_altitude_m;
+            yaw_deg = m_telemetry->heading().heading_deg;
+        } else {
+            err("GOTO needs lat lon alt or a saved mark", -1);
+            return;
+        }
+
+        if (cmd_goto(latitude_deg, longitude_deg, absolute_altitude_m, yaw_deg)) {
+            snprintf(resp, resp_size, "OK %s %.7f %.7f %.1f %.1f",
+                     cmd_name, latitude_deg, longitude_deg, absolute_altitude_m, yaw_deg);
+        } else {
+            err("GOTO", -1);
+        }
+    }
+    else if (strcmp(cmd_name, "SET_HOME") == 0) {
+        if (argc >= 3) {
+            if (cmd_set_mark(args[0], args[1], args[2])) {
+                snprintf(resp, resp_size, "OK SET_HOME %.7f %.7f %.1f", args[0], args[1], args[2]);
+            } else {
+                err("SET_HOME", -1);
+            }
+        } else if (m_mark_valid) {
+            snprintf(resp, resp_size, "OK SET_HOME %.7f %.7f %.1f",
+                     m_mark_latitude_deg, m_mark_longitude_deg, m_mark_absolute_altitude_m);
+        } else {
+            snprintf(resp, resp_size, "ERR mark unset");
+        }
+    }
+    else if (strcmp(cmd_name, "SET_MODE") == 0) {
+        Mode next_mode = m_mode;
+        if (argc > 0) {
+            next_mode = args[0] > 0.5f ? Mode::Auto : Mode::Manual;
+        }
+        set_mode(next_mode);
+        snprintf(resp, resp_size, "OK SET_MODE %s", mode_to_str(next_mode));
     }
     else if (strcmp(cmd_name, "VELOCITY") == 0) {
         float vx = argc > 0 ? args[0] : 0;
@@ -593,7 +782,16 @@ void Bridge::exec_cmd(const char *cmd_name, float *args, int argc,
 void Bridge::build_status_response(char *resp, int resp_size) {
     auto pos = m_telemetry->position();
     auto armed = m_telemetry->armed();
+    auto in_air = m_telemetry->in_air();
+    auto gps = m_telemetry->gps_info();
+    auto attitude = m_telemetry->attitude_euler();
+    auto velocity = m_telemetry->velocity_ned();
+    auto heading = m_telemetry->heading();
+    auto battery = m_telemetry->battery();
+    auto health = m_telemetry->health();
     auto flight_mode = m_telemetry->flight_mode();
+    auto health_all_ok = m_telemetry->health_all_ok();
+    auto home = m_telemetry->home();
 
     const char* mode_str = "UNKNOWN";
     switch (flight_mode) {
@@ -612,8 +810,49 @@ void Bridge::build_status_response(char *resp, int resp_size) {
         default:                                             mode_str = "OTHER"; break;
     }
 
-    snprintf(resp, resp_size, "TELEMETRY %.1f %.7f %.7f %d %s",
-             pos.relative_altitude_m, pos.latitude_deg, pos.longitude_deg,
-             armed ? 1 : 0, mode_str);
+    if (m_mark_valid) {
+        snprintf(resp, resp_size,
+                 "TELEMETRY mode=%s armed=%s in_air=%s health_all_ok=%s gps_fix=%s gps_sat=%d pos=(%.7f,%.7f,abs=%.1f,rel=%.1f) att=(r=%.1f,p=%.1f,y=%.1f) heading=%.1f vel=(n=%.1f,e=%.1f,d=%.1f) batt=(rem=%.1f,v=%.1f,i=%.1f) home=(%.7f,%.7f,abs=%.1f) mark=(%.7f,%.7f,abs=%.1f) health=(gyro=%s,accel=%s,mag=%s,local=%s,global=%s,home=%s,armable=%s)",
+                 mode_str,
+                 yesno(armed),
+                 yesno(in_air),
+                 yesno(health_all_ok),
+                 gps_fix_to_str(gps.fix_type), gps.num_satellites,
+                 pos.latitude_deg, pos.longitude_deg, pos.absolute_altitude_m, pos.relative_altitude_m,
+                 attitude.roll_deg, attitude.pitch_deg, attitude.yaw_deg,
+                 heading.heading_deg,
+                 velocity.north_m_s, velocity.east_m_s, velocity.down_m_s,
+                 battery.remaining_percent, battery.voltage_v, battery.current_battery_a,
+                 home.latitude_deg, home.longitude_deg, home.absolute_altitude_m,
+                 m_mark_latitude_deg, m_mark_longitude_deg, m_mark_absolute_altitude_m,
+                 yesno(health.is_gyrometer_calibration_ok),
+                 yesno(health.is_accelerometer_calibration_ok),
+                 yesno(health.is_magnetometer_calibration_ok),
+                 yesno(health.is_local_position_ok),
+                 yesno(health.is_global_position_ok),
+                 yesno(health.is_home_position_ok),
+                 yesno(health.is_armable));
+    } else {
+        snprintf(resp, resp_size,
+                 "TELEMETRY mode=%s armed=%s in_air=%s health_all_ok=%s gps_fix=%s gps_sat=%d pos=(%.7f,%.7f,abs=%.1f,rel=%.1f) att=(r=%.1f,p=%.1f,y=%.1f) heading=%.1f vel=(n=%.1f,e=%.1f,d=%.1f) batt=(rem=%.1f,v=%.1f,i=%.1f) home=(%.7f,%.7f,abs=%.1f) mark=unset health=(gyro=%s,accel=%s,mag=%s,local=%s,global=%s,home=%s,armable=%s)",
+                 mode_str,
+                 yesno(armed),
+                 yesno(in_air),
+                 yesno(health_all_ok),
+                 gps_fix_to_str(gps.fix_type), gps.num_satellites,
+                 pos.latitude_deg, pos.longitude_deg, pos.absolute_altitude_m, pos.relative_altitude_m,
+                 attitude.roll_deg, attitude.pitch_deg, attitude.yaw_deg,
+                 heading.heading_deg,
+                 velocity.north_m_s, velocity.east_m_s, velocity.down_m_s,
+                 battery.remaining_percent, battery.voltage_v, battery.current_battery_a,
+                 home.latitude_deg, home.longitude_deg, home.absolute_altitude_m,
+                 yesno(health.is_gyrometer_calibration_ok),
+                 yesno(health.is_accelerometer_calibration_ok),
+                 yesno(health.is_magnetometer_calibration_ok),
+                 yesno(health.is_local_position_ok),
+                 yesno(health.is_global_position_ok),
+                 yesno(health.is_home_position_ok),
+                 yesno(health.is_armable));
+    }
 }
 
